@@ -1,10 +1,3 @@
-// pub struct Fan{
-
-// }
-// impl Fan {
-    
-// }
-
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -29,21 +22,21 @@ impl Fan {
             period_ns: 1_000_000_000 / frequency_hz, // Convert Hz to nanoseconds
         };
         
-        // Export the PWM channel if not already exported
-        if !fan.is_exported() {
-            fan.export()?;
-            // Give the system time to create the sysfs files
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        // // Export the PWM channel if not already exported
+        // if !fan.is_exported() {
+        //     fan.export()?;
+        //     // Give the system time to create the sysfs files
+        //     std::thread::sleep(std::time::Duration::from_millis(100));
+        // }
         
-        // Set the period
-        fan.write_attribute("period", &fan.period_ns.to_string())?;
+        // // Set the period
+        // fan.write_attribute("period", &fan.period_ns.to_string())?;
         
-        // Set initial duty cycle to 0 (fan off)
-        fan.write_attribute("duty_cycle", "0")?;
+        // // Set initial duty cycle to 0 (fan off)
+        // fan.write_attribute("duty_cycle", "0")?;
         
-        // Enable the PWM
-        fan.write_attribute("enable", "1")?;
+        // // Enable the PWM
+        // fan.write_attribute("enable", "1")?;
         
         Ok(fan)
     }

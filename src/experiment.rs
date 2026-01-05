@@ -1,3 +1,4 @@
+use crate::camera::Camera;
 use crate::fan::Fan;
 use crate::tec::*;
 use serde::{Deserialize, Serialize};
@@ -9,42 +10,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nix::unistd::Pid;
 use nix::sys::signal::{self, Signal};
-/// Guard that ensures the camera process is killed when dropped
-struct VideoProcessGuard {
-    process: Child,
-}
-
-impl VideoProcessGuard {
-    fn new(process: Child) -> Self {
-        VideoProcessGuard { process }
-    }
-}
-
-impl Drop for VideoProcessGuard {
-    fn drop(&mut self) {
-        println!("Stopping video recording...");
-        // let _ = self.process.kill();
-
-            let pid = Pid::from_raw(self.process.id() as i32);
-
-    println!("Child process spawned with PID: {}", pid);
-
-    // 2. Wait for a moment to ensure the process is running
-    thread::sleep(Duration::from_secs(1));
-
-    // 3. Send SIGINT (Signal 2) to the process
-    println!("Sending SIGINT (Signal 2) to the child process...");
-    nix::sys::signal::kill(pid, Some(Signal::SIGINT)).unwrap();
-
-    println!("Signal sent. Waiting for child to terminate...");
-
-    // 4. Wait for the child process to finish after receiving the signal
-    let status = self.process.wait().unwrap();
-    println!("Child process exited with status: {}", status);
-
-
-    }
-}
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Serialize, Deserialize)]
 pub struct Parameters {
@@ -71,55 +37,56 @@ impl Default for Parameters {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct PhaseTiming {
+    pub phase_name: String,
+    pub start_time_ms: u64,
+    pub end_time_ms: u64,
+    pub duration_s: f64,
+}
+
 pub struct Experiment {
     tec: Arc<Mutex<TecController>>,
     fan: Fan,
     params: Parameters,
     experiment_dir: String,
+    phase_timings: Vec<PhaseTiming>,
 }
 
 impl Experiment {
     pub fn new(tec_controller: Arc<Mutex<TecController>>, fan: Fan, params: Parameters) -> Self {
         Experiment {
             tec: tec_controller,
-            fan: fan,
+            fan,
             params,
             experiment_dir: String::new(),
+            phase_timings: Vec::new(),
         }
     }
 
-    
-
-    fn create_experiment_directory(&mut self) -> std::io::Result<()> {
-        // Create experiments base directory if it doesn't exist
-        fs::create_dir_all("experiments")?;
-        
-        // Create timestamped subdirectory for this experiment
-        let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-        self.experiment_dir = format!("experiments/experiment_{}", timestamp);
-        fs::create_dir_all(&self.experiment_dir)?;
-        
-        println!("Created experiment directory: {}", self.experiment_dir);
-        Ok(())
+    fn record_phase_timing(&mut self, phase_name: String, start_time_ms: u64, end_time_ms: u64) {
+        let duration_s = (end_time_ms - start_time_ms) as f64 / 1000.0;
+        self.phase_timings.push(PhaseTiming {
+            phase_name,
+            start_time_ms,
+            end_time_ms,
+            duration_s,
+        });
     }
 
-   
-    fn save_parameters(&self) -> std::io::Result<()> {
-        let params_path = format!("{}/parameters.yaml", self.experiment_dir);
+    fn save_phase_timings(&self) -> std::io::Result<()> {
+        let timings_path = format!("{}/phase_timings.yaml", self.experiment_dir);
         
-        let yaml_string = serde_yaml::to_string(&self.params)
+        let yaml_string = serde_yaml::to_string(&self.phase_timings)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&params_path)?;
+            .open(&timings_path)?;
         file.write_all(yaml_string.as_bytes())?;
-        println!("Parameters saved to: {}", params_path);
+        println!("Phase timings saved to: {}", timings_path);
         Ok(())
     }
 
@@ -136,12 +103,22 @@ impl Experiment {
     }
 
     fn wait_for_temperature(&self, target_temp: f32) -> Result<(), String> {
-        println!("Waiting for temperature to reach {:.1}°C...", target_temp);
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                .unwrap(),
+        );
+        pb.set_message(format!("Waiting for temperature to reach {:.1}°C...", target_temp));
+
         let start_time = SystemTime::now();
         let max_wait = Duration::from_secs_f32(self.params.max_wait_time);
 
         loop {
+            pb.tick();
+            
             if start_time.elapsed().unwrap() > max_wait {
+                pb.finish_with_message(format!("❌ Timeout waiting for {:.1}°C", target_temp));
                 return Err(format!(
                     "Timeout waiting for temperature to reach {:.1}°C",
                     target_temp
@@ -152,17 +129,18 @@ impl Experiment {
                 Ok(mut controller) => match controller.get_single_readout() {
                     Ok(readout) => {
                         let temp_diff = (readout.t_measured - target_temp).abs();
+                        pb.set_message(format!(
+                            "Current: {:.1}°C | Target: {:.1}°C | Diff: {:.1}°C",
+                            readout.t_measured, target_temp, temp_diff
+                        ));
+
                         if temp_diff <= self.params.temperature_tolerance {
-                            println!(
-                                "Temperature reached: {:.1}°C (target: {:.1}°C)",
+                            pb.finish_with_message(format!(
+                                "✓ Temperature reached: {:.1}°C (target: {:.1}°C)",
                                 readout.t_measured, target_temp
-                            );
+                            ));
                             return Ok(());
                         }
-                        println!(
-                            "Current: {:.1}°C, Target: {:.1}°C, Diff: {:.1}°C",
-                            readout.t_measured, target_temp, temp_diff
-                        );
                     }
                     Err(e) => eprintln!("Failed to read temperature: {}", e),
                 },
@@ -171,33 +149,6 @@ impl Experiment {
 
             thread::sleep(Duration::from_millis(1000));
         }
-    }
-
-    fn start_video_recording(&self) -> std::io::Result<VideoProcessGuard> {
-        println!("Starting video capture...");
-
-        let video_filename = format!("{}/video.h264", self.experiment_dir);
-        let pts_filename = format!("{}/timestamps.txt", self.experiment_dir);
-
-        // Set timeout to  to ensure it captures the full experiment
-        // We'll kill it manually when done
-        let process = Command::new("rpicam-vid")
-            .args([
-                "-o",
-                &video_filename,
-                "-t",
-                "0", 
-                "--save-pts",
-                &pts_filename,
-                "--flush",
-                "--nopreview",
-                "--mode","1920:1080:10:P"
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        
-        Ok(VideoProcessGuard::new(process))
     }
 
     fn start_temperature_logging(&self) -> thread::JoinHandle<()> {
@@ -210,9 +161,9 @@ impl Experiment {
 
             loop {
                 let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64;
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
 
                 match tec_clone.lock() {
                     Ok(mut controller) => match controller.get_single_readout() {
@@ -264,22 +215,15 @@ impl Experiment {
         println!("  Post-record time: {:.1}s", self.params.postrecord_time);
 
         // Create experiment directory
-        self.create_experiment_directory()?;
+        self.experiment_dir = create_experiment_directory()?;
 
         // Save parameters to YAML
-        if let Err(e) = self.save_parameters() {
-            eprintln!("Failed to save parameters: {}", e);
-            return Err(Box::new(e));
-        }
+        save_parameters(&self.experiment_dir, &self.params)?;
 
         // Initialize log file
-        if let Err(e) = self.initialize_log_file() {
-            eprintln!("Failed to initialize log file: {}", e);
-            return Err(Box::new(e));
-        }
+        self.initialize_log_file()?;
 
         // Configure and enable TEC
-
         {
             let mut controller = self.tec.lock().unwrap();
 
@@ -287,7 +231,6 @@ impl Experiment {
             let config = TecConfig {
                 t_set: self.params.rest_temp,
                 ..controller.current_config
-           
             };
 
             println!("Configuring TEC...");
@@ -314,66 +257,76 @@ impl Experiment {
                 }
             }
         }
-        self.fan.on_full();
+        // self.fan.on_full();
 
-        // Set initial rest temperature and wait for stabilization
+        // Phase 0: Initial temperature stabilization
+        let phase_start = get_timestamp_ms();
         {
             let mut controller = self.tec.lock().unwrap();
             controller.set_t(self.params.rest_temp);
         }
         self.wait_for_temperature(self.params.rest_temp)?;
+        let phase_end = get_timestamp_ms();
+        self.record_phase_timing("Initial stabilization".to_string(), phase_start, phase_end);
 
-        // Start video recording
-        let _video_guard = self.start_video_recording()?;
+        // Initialize camera
+        let mut camera = Camera::new(&self.experiment_dir);
+        camera.start()?;
 
         // Start temperature logging thread
         let _logging_thread = self.start_temperature_logging();
 
-        // Pre-record phase at rest temperature
-        println!(
-            "Phase 1: Pre-recording at rest temperature for {:.1}s",
-            self.params.prerecord_time
-        );
-        thread::sleep(Duration::from_secs_f32(self.params.prerecord_time));
+        // Phase 1: Pre-record at rest temperature
+        let phase_start = get_timestamp_ms();
+        let pb = create_phase_progress_bar(self.params.prerecord_time, "Phase 1: Pre-recording at rest temperature");
+        sleep_with_progress(&pb, self.params.prerecord_time);
+        pb.finish_with_message("✓ Phase 1 complete");
+        let phase_end = get_timestamp_ms();
+        self.record_phase_timing("Pre-record at rest temp".to_string(), phase_start, phase_end);
 
-        // Change to snap temperature
-        println!(
-            "Phase 2: Changing to snap temperature {:.1}°C",
-            self.params.snap_temp
-        );
+        // Phase 2: Change to snap temperature
+        let phase_start = get_timestamp_ms();
+        println!("Phase 2: Changing to snap temperature {:.1}°C", self.params.snap_temp);
         {
             let mut controller = self.tec.lock().unwrap();
             controller.set_t(self.params.snap_temp);
         }
         self.wait_for_temperature(self.params.snap_temp)?;
+        let phase_end = get_timestamp_ms();
+        self.record_phase_timing("Heat to snap temp".to_string(), phase_start, phase_end);
 
-        // Hold at snap temperature
-        println!(
-            "Phase 3: Holding at snap temperature for {:.1}s",
-            self.params.snap_hold_time
-        );
-        thread::sleep(Duration::from_secs_f32(self.params.snap_hold_time));
+        // Phase 3: Hold at snap temperature
+        let phase_start = get_timestamp_ms();
+        let pb = create_phase_progress_bar(self.params.snap_hold_time, "Phase 3: Holding at snap temperature");
+        sleep_with_progress(&pb, self.params.snap_hold_time);
+        pb.finish_with_message("✓ Phase 3 complete");
+        let phase_end = get_timestamp_ms();
+        self.record_phase_timing("Hold at snap temp".to_string(), phase_start, phase_end);
 
-        // Return to rest temperature
-        println!(
-            "Phase 4: Returning to rest temperature {:.1}°C",
-            self.params.rest_temp
-        );
+        // Phase 4: Return to rest temperature
+        let phase_start = get_timestamp_ms();
+        println!("Phase 4: Returning to rest temperature {:.1}°C", self.params.rest_temp);
         {
             let mut controller = self.tec.lock().unwrap();
             controller.set_t(self.params.rest_temp);
         }
         // Note: We don't wait for temperature to stabilize here as we want to capture the cooling
+        let phase_end = get_timestamp_ms();
+        self.record_phase_timing("Initiate cooling".to_string(), phase_start, phase_end);
 
-        // Post-record phase
-        println!(
-            "Phase 5: Post-recording for {:.1}s",
-            self.params.postrecord_time
-        );
-        thread::sleep(Duration::from_secs_f32(self.params.postrecord_time));
+        // Phase 5: Post-record
+        let phase_start = get_timestamp_ms();
+        let pb = create_phase_progress_bar(self.params.postrecord_time, "Phase 5: Post-recording");
+        sleep_with_progress(&pb, self.params.postrecord_time);
+        pb.finish_with_message("✓ Phase 5 complete");
+        let phase_end = get_timestamp_ms();
+        self.record_phase_timing("Post-record".to_string(), phase_start, phase_end);
 
-        // Video process will be automatically stopped when _video_guard goes out of scop
-        self.fan.off();
+        // Stop camera
+        camera.stop()?;
+
+        // self.fan.off();
+
         // Disable TEC
         {
             let mut controller = self.tec.lock().unwrap();
@@ -384,13 +337,83 @@ impl Experiment {
             }
         }
 
-        println!("Experiment completed!");
+        // Save phase timings
+        self.save_phase_timings()?;
+
+        println!("\n✓ Experiment completed!");
         println!("Results saved to: {}", self.experiment_dir);
         println!("  - parameters.yaml");
+        println!("  - phase_timings.yaml");
         println!("  - video.h264");
         println!("  - timestamps.txt");
         println!("  - temperature_log.csv");
 
         Ok(())
+    }
+}
+
+// Utility functions
+
+/// Create a timestamped experiment directory
+fn create_experiment_directory() -> std::io::Result<String> {
+    // Create experiments base directory if it doesn't exist
+    fs::create_dir_all("experiments")?;
+    
+    // Create timestamped subdirectory for this experiment
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let experiment_dir = format!("experiments/experiment_{}", timestamp);
+    fs::create_dir_all(&experiment_dir)?;
+    
+    println!("Created experiment directory: {}", experiment_dir);
+    Ok(experiment_dir)
+}
+
+/// Save experiment parameters to YAML file
+fn save_parameters(experiment_dir: &str, params: &Parameters) -> std::io::Result<()> {
+    let params_path = format!("{}/parameters.yaml", experiment_dir);
+    
+    let yaml_string = serde_yaml::to_string(params)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&params_path)?;
+    file.write_all(yaml_string.as_bytes())?;
+    println!("Parameters saved to: {}", params_path);
+    Ok(())
+}
+
+/// Get current timestamp in milliseconds
+fn get_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Create a progress bar for a timed phase
+fn create_phase_progress_bar(duration_s: f32, message: &str) -> ProgressBar {
+    let pb = ProgressBar::new((duration_s * 10.0) as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg}\n[{elapsed_precise}] [{bar:40.cyan/blue}] {percent}% ({eta})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pb.set_message(message.to_string());
+    pb
+}
+
+/// Sleep with progress bar updates
+fn sleep_with_progress(pb: &ProgressBar, duration_s: f32) {
+    let steps = (duration_s * 10.0) as u64;
+    for _ in 0..steps {
+        thread::sleep(Duration::from_millis(100));
+        pb.inc(1);
     }
 }

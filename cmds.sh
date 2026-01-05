@@ -1,0 +1,1 @@
+rpicam-vid -o video.h264 -t 1min --mode 1920:1080:10:P --framerate 30 --info-text="#%frame %fps fps"

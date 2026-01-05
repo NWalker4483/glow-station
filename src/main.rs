@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 mod experiment;
 mod tec;
 mod fan;
+mod camera;
 use experiment::{Experiment, Parameters};
 use tec::*;
 
@@ -9,7 +10,7 @@ use crate::fan::Fan;
 fn main() -> std::io::Result<()> {
     println!("Initializing TEC Controller...");
 
-env_logger::init();
+    env_logger::init();
     // Initialize TEC controller - adjust port name as needed (/dev/ttyUSB0, /dev/ttyACM0, etc.)
     let tec_controller = match TecController::new("/dev/serial0") {
         Ok(controller) => Arc::new(Mutex::new(controller)),
