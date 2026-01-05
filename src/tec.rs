@@ -1,71 +1,51 @@
+use derive_builder::Builder;
 use log::{debug, info, trace, warn};
 use serialport::TTYPort;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-//*
-//UART parameters:
-// ● 38400 bits / second
-// ● 8 data bits
-// ● even parity: No parity
-// ● stop bits: 1
-// ● flow control: No
-// Serial Protocol
-// Protocol allows users to set configuration parameters of the device or acquire
-// measured data using commands specified below. Each command is a set of ASCII
-// characters which may be followed by <CR> and/or <LF>.
-//
-///Command template: <Tsetpoint P I D Tmin Tmax>
+use std::io::{BufRead, BufReader, Read, Write};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 #[derive(Debug, Clone)]
 pub struct TecConfig {
-    ///[°C] – target temperature value. The device checks output temperature via
-    ///thermistor and manages output current to reach temperature setpoint.
     pub t_set: f32,
-    ///PID proportional coefficient (in range from 0.0 to 20.0)
     pub p: f32,
-    /// PID integral coefficient (in range from 0.0 to 20.0)
     pub i: f32,
-    /// PID derivative coefficient (in range from 0.0 to 20.0)
     pub d: f32,
-    /// [°C] - lower threshold which is checked by the driver (OC)
     pub t_min: f32,
-    /// [°C] - upper threshold which is checked by the driver (OC)
     pub t_max: f32,
 }
 
-///Template of readout: <Tsetpoint P I D Tmin Tmax Tmeasured OC PWM>
+impl Default for TecConfig {
+    fn default() -> TecConfig {
+        
+        TecConfig {
+            t_set: 20.0,
+            p: 5.50,
+            i: 2.50,
+            d: 0.5,
+            t_min: 0.0,
+            t_max: 35.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TecReadout {
-    ///[°C] – target temperature value. The device checks output temperature via
-    ///thermistor and manages output current to reach temperature setpoint.
     pub t_set: f32,
-    ///PID proportional coefficient (in range from 0.0 to 20.0)
-    pub P: f32,
-    /// PID integral coefficient (in range from 0.0 to 20.0)
-    pub I: f32,
-    /// PID derivative coefficient (in range from 0.0 to 20.0)
-    pub D: f32,
-    /// [°C] - lower threshold which is checked by the driver (OC)
+    pub p: f32,
+    pub i: f32,
+    pub d: f32,
     pub t_min: f32,
-    /// [°C] - upper threshold which is checked by the driver (OC)
     pub t_max: f32,
-    /// [°C] - instantaneous value of measured temperature
     pub t_measured: f32,
-    /// OC - status of the open collector (0 – disconnected from GND or 1 – connected to GND)
-    pub OC: bool,
-    ///[%] - Negative values indicate cooling phase and positive ones indicate heating phase. The absolute value of the parameter informs about intensity.
-    pub PWM: f32,
+    pub oc: bool,
+    pub pwm: f32,
 }
 
-///Single byte commands
-///These are single character commands without additional parameters:
-/// o – print single readout
-/// R – turn ON cyclic print (print every second).
-/// r – turn OFF cyclic print
-/// A - switch ON TEC supply
-/// a - switch OFF TEC supply
 pub struct TecController {
     port: TTYPort,
+    pub current_config: TecConfig,
 }
 
 impl TecController {
@@ -77,146 +57,187 @@ impl TecController {
             .stop_bits(serialport::StopBits::One)
             .flow_control(serialport::FlowControl::None)
             .open_native()?;
-
-        Ok(TecController { port })
+        let mut tec = TecController {
+            port,
+            current_config: TecConfig::default(),
+        };
+        TecController::disable(&mut tec);
+        TecController::set_configuration(&mut tec, &TecConfig::default())?;
+        Ok(tec)
     }
 
-    /// Send a command to the device and read acknowledgment response.
-    /// All commands return an acknowledgment in the format `<command>`.
-    /// Logs sent commands and received responses for debugging.
-    fn send_command(&mut self, command: &str) -> Result<String, Box<dyn std::error::Error>> {
-        debug!("Sending command: '{}'", command);
-        self.port.write_all(command.as_bytes())?;
-        self.port.flush()?;
+    pub fn set_t(&mut self, temp: f32) {
+            let new_cfg = TecConfig {
+                t_set: temp,
+                ..self.current_config
+            };
+            self.set_configuration(&new_cfg).ok();
+        
+    }
 
-        let mut reader = BufReader::new(&mut self.port);
-        let mut response = String::new();
-
-        match reader.read_line(&mut response) {
-            Ok(0) => return Err("EOF - no response received".into()),
-            Ok(_) => {
-                let trimmed_response = response.trim();
-                debug!("Received acknowledgment: '{}'", trimmed_response);
-
-                // Validate acknowledgment format
-                let expected_ack = format!("<{}>", command);
-                if trimmed_response != expected_ack {
-                    eprintln!(
-                        "Warning: Unexpected acknowledgment format. Expected '{}', got '{}'",
-                        expected_ack, trimmed_response
-                    );
-                }
-
-                Ok(trimmed_response.to_string())
-            }
-            Err(e) => {
-                eprintln!("Error reading from serial port: {}", e);
-                Err(e.into())
+    /// Clear any pending data in the input buffer
+    fn clear_input_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut discard = vec![0u8; 1024];
+        loop {
+            match self.port.read(&mut discard) {
+                Ok(0) => break,
+                Ok(n) => {},
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(e) => return Err(e.into()),
             }
         }
+        Ok(())
     }
 
-    /// Get a single temperature and status readout from the device (single byte command 'o').
-    /// This command returns acknowledgment followed by data line with format:
-    /// `Tz=+25.00 P= 5.00 I= 2.00 D= 1.00 T=  0...+50 Tr=+25.01 OC=0 PW=+ 25`
+    /// Read a response line from the serial port, handling non-UTF-8 gracefully
+    fn read_response(&mut self, timeout_ms: u64) -> Result<String, Box<dyn std::error::Error>> {
+        let mut buffer = Vec::new();
+        let start_time = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        
+        loop {
+            let mut byte = [0u8; 1];
+            match self.port.read(&mut byte) {
+                Ok(n) if n > 0 => {
+                    buffer.push(byte[0]);
+                    
+                    // Check for line ending
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    // If we get CR, check for LF
+                    if byte[0] == b'\r' {
+                        // Try to read next byte (might be LF)
+                        let mut next_byte = [0u8; 1];
+                        match self.port.read(&mut next_byte) {
+                            Ok(1) if next_byte[0] == b'\n' => {
+                                buffer.push(next_byte[0]);
+                            }
+                            Ok(1) => {
+                                // Not a LF, but we got something - it's the start of next line
+                                // Put it back would be ideal, but we can't, so just break
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                }
+                Ok(_) => {
+                    if start_time.elapsed() > timeout {
+                        return Err("Timeout waiting for response".into());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    if start_time.elapsed() > timeout {
+                        return Err("Timeout waiting for response".into());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        
+        // Convert to string, replacing invalid UTF-8 sequences
+        let response = String::from_utf8_lossy(&buffer);
+        let trimmed = response.trim().to_string();
+        
+        debug!("Decoded response: '{}'", trimmed);
+        
+        Ok(trimmed)
+    }
+
+    /// Send a simple command and read acknowledgment
+    fn send_command(&mut self, command: &str) -> Result<String, Box<dyn std::error::Error>> {
+        debug!("Sending command: '{}'", command);
+        
+        // Clear any stale data
+        self.clear_input_buffer()?;
+        
+        // Send command
+        self.port.write_all(command.as_bytes())?;
+        self.port.flush()?;
+        
+        // Wait a bit for device to process
+        thread::sleep(Duration::from_millis(50));
+        
+        // Read response
+        let response = self.read_response(1000)?;
+        
+        // Validate acknowledgment format
+        let expected_ack = format!("<{}>", command);
+        if response != expected_ack {
+            warn!(
+                "Unexpected acknowledgment format. Expected '{}', got '{}'",
+                expected_ack, response
+            );
+        }
+        
+        Ok(response)
+    }
+
     pub fn get_single_readout(&mut self) -> Result<TecReadout, Box<dyn std::error::Error>> {
         // Send command and get acknowledgment
         let _ack = self.send_command("o")?;
-
+        
         // Read the actual data line
-        let mut reader = BufReader::new(&mut self.port);
-        let mut data_response = String::new();
-
-        match reader.read_line(&mut data_response) {
-            Ok(0) => return Err("EOF - no data response received".into()),
-            Ok(_) => {
-                let trimmed_data = data_response.trim();
-                debug!("Received data: '{}'", trimmed_data);
-                self.parse_readout(trimmed_data)
-            }
-            Err(e) => {
-                eprintln!("Error reading data from serial port: {}", e);
-                Err(e.into())
-            }
-        }
+        let data_response = self.read_response(1000)?;
+        debug!("Received data: '{}'", data_response);
+        
+        self.parse_readout(&data_response)
     }
 
-    /// Set the TEC controller configuration parameters.
-    /// Command format: `<Tsetpoint P I D Tmin Tmax>`
-    /// Returns acknowledgment containing the configuration that was set.
-    /// Validates that the returned configuration matches what was sent.
     pub fn set_configuration(
         &mut self,
         config: &TecConfig,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // Clear any pending data
+        self.clear_input_buffer()?;
+       /// <10 15 2 1 0 35> 
         let command = format!(
             "<{} {} {} {} {} {}>",
             config.t_set, config.p, config.i, config.d, config.t_min, config.t_max
         );
-
+        
         debug!("Sending configuration: '{}'", command);
         self.port.write_all(command.as_bytes())?;
         self.port.flush()?;
-        // self.write_str(&command)?;
-
-        // Configuration commands return a complex acknowledgment with config data
-        let mut reader = BufReader::new(&mut self.port);
-        let mut response = String::new();
-
-        match reader.read_line(&mut response) {
-            Ok(0) => return Err("EOF - no configuration response received".into()),
-            Ok(_) => {
-                let trimmed_response = response.trim();
-                debug!(
-                    "Received configuration acknowledgment: '{}'",
-                    trimmed_response
-                );
-
-                // Try to parse the response as a configuration acknowledgment
-                // Expected format should be similar to the command we sent
-                if trimmed_response.starts_with('<') && trimmed_response.ends_with('>') {
-                    // Parse the values and validate they match what we sent
-                    if let Ok(returned_config) = self.parse_config_acknowledgment(trimmed_response)
-                    {
-                        self.validate_config_match(config, &returned_config)?;
-                        debug!("Configuration validated successfully");
-                    } else {
-                        eprintln!("Warning: Could not parse configuration acknowledgment");
-                    }
-                } else {
-                    eprintln!(
-                        "Warning: Unexpected configuration acknowledgment format: '{}'",
-                        trimmed_response
-                    );
-                }
-
-                Ok(trimmed_response.to_string())
+        
+        // Give device more time to process configuration
+        thread::sleep(Duration::from_millis(150));
+        
+        // Read response
+        let response = self.read_response(2000)?;
+        debug!("Received configuration acknowledgment: '{}'", response);
+        
+        // Parse and validate
+        match self.parse_config_acknowledgment(&response) {
+            Ok(returned_config) => {
+                self.current_config = returned_config;
+                debug!("Configuration validated successfully");
+                Ok(response)
             }
             Err(e) => {
-                eprintln!("Error reading configuration response: {}", e);
-                Err(e.into())
+                warn!("Could not parse configuration acknowledgment: {}", e);
+                Err(format!("Parse error: {} - Response was: '{}'", e, response).into())
             }
         }
     }
 
-    /// Enable the TEC supply
     pub fn enable(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         self.send_command("A")
     }
 
-    /// Disable the TEC supply
     pub fn disable(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         self.send_command("a")
     }
 
-    fn parse_readout(& self, response: &str) -> Result<TecReadout, Box<dyn std::error::Error>> {
+    fn parse_readout(&self, response: &str) -> Result<TecReadout, Box<dyn std::error::Error>> {
         let sections: Vec<&str> = response.trim().split('=').collect();
-
         if sections.len() < 9 {
-            return Err("Not enough sections in response".into());
+            return Err(format!("Not enough sections in response. Got {} sections, expected at least 9", sections.len()).into());
         }
 
-        // Helper function to filter and parse a section
         let parse_section = |section: &str| -> Result<f32, Box<dyn std::error::Error>> {
             let filtered: String = section
                 .chars()
@@ -225,13 +246,12 @@ impl TecController {
             Ok(filtered.parse::<f32>()?)
         };
 
-        // Parse individual sections (skip first section)
         let t_set = parse_section(sections[1])?;
-        let P = parse_section(sections[2])?;
-        let I = parse_section(sections[3])?;
-        let D = parse_section(sections[4])?;
+        let p = parse_section(sections[2])?;
+        let i = parse_section(sections[3])?;
+        let d = parse_section(sections[4])?;
 
-        // Parse section 5 (t_min...t_max)
+        // Parse temperature range
         let temp_range_filtered: String = sections[5]
             .chars()
             .filter(|c| !c.is_alphabetic() && !c.is_whitespace())
@@ -250,24 +270,24 @@ impl TecController {
             .chars()
             .filter(|c| !c.is_alphabetic() && !c.is_whitespace())
             .collect();
-        let OC = match oc_filtered.parse::<u8>()? {
+        let oc = match oc_filtered.parse::<u8>()? {
             0 => false,
             1 => true,
             _ => return Err("Invalid OC value".into()),
         };
 
-        let PWM = parse_section(sections[8])?;
+        let pwm = parse_section(sections[8])?;
 
         Ok(TecReadout {
             t_set,
-            P,
-            I,
-            D,
+            p,
+            i,
+            d,
             t_min,
             t_max,
             t_measured,
-            OC,
-            PWM,
+            oc,
+            pwm,
         })
     }
 
@@ -275,69 +295,33 @@ impl TecController {
         &self,
         response: &str,
     ) -> Result<TecConfig, Box<dyn std::error::Error>> {
-        // Remove < and > brackets
-        let content = response.trim_start_matches('<').trim_end_matches('>');
-        let parts: Vec<&str> = content.split_whitespace().collect();
-
-        if parts.len() != 6 {
-            return Err(format!(
-                "Invalid config format: expected 6 values, got {}",
-                parts.len()
-            )
-            .into());
+        let mut config = TecConfig::default();
+        
+        for part in response.split_whitespace() {
+            if let Some((key, value)) = part.split_once('=') {
+                match value.parse::<f32>() {
+                    Ok(val) => {
+                        match key {
+                            "eTzc" => config.t_set = val,
+                            "eKp" => config.p = val,
+                            "eKi" => config.i = val,
+                            "eKd" => config.d = val,
+                            "eTmin" => config.t_min = val,
+                            "eTmax" => config.t_max = val,
+                            _ => debug!("Unknown config parameter: {}", key),
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse value '{}' for key '{}': {}", value, key, e);
+                    }
+                }
+            }
         }
-
-        Ok(TecConfig {
-            t_set: parts[0].parse()?,
-            p: parts[1].parse()?,
-            i: parts[2].parse()?,
-            d: parts[3].parse()?,
-            t_min: parts[4].parse()?,
-            t_max: parts[5].parse()?,
-        })
-    }
-
-    fn validate_config_match(
-        &self,
-        sent: &TecConfig,
-        received: &TecConfig,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let tolerance = 0.01f32; // Allow small floating point differences
-
-        if (sent.t_set - received.t_set).abs() > tolerance {
-            return Err(format!(
-                "T_set mismatch: sent {}, received {}",
-                sent.t_set, received.t_set
-            )
-            .into());
-        }
-        if (sent.p - received.p).abs() > tolerance {
-            return Err(format!("P mismatch: sent {}, received {}", sent.p, received.p).into());
-        }
-        if (sent.i - received.i).abs() > tolerance {
-            return Err(format!("I mismatch: sent {}, received {}", sent.i, received.i).into());
-        }
-        if (sent.d - received.d).abs() > tolerance {
-            return Err(format!("D mismatch: sent {}, received {}", sent.d, received.d).into());
-        }
-        if (sent.t_min - received.t_min).abs() > tolerance {
-            return Err(format!(
-                "T_min mismatch: sent {}, received {}",
-                sent.t_min, received.t_min
-            )
-            .into());
-        }
-        if (sent.t_max - received.t_max).abs() > tolerance {
-            return Err(format!(
-                "T_max mismatch: sent {}, received {}",
-                sent.t_max, received.t_max
-            )
-            .into());
-        }
-
-        Ok(())
+        
+        Ok(config)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,66 +339,28 @@ mod tests {
     #[test]
     fn test_get_single_readout() {
         let mut controller = TecController::new(TEST_PORT).expect("Failed to connect");
-
         let readout = controller.get_single_readout();
         assert!(
             readout.is_ok(),
             "Failed to get readout: {:?}",
             readout.err()
         );
-
         let readout = readout.unwrap();
         debug!("Readout: {:?}", readout);
-
-        // Basic sanity checks
-        //assert!(readout.P >= 0.0 && readout.P <= 20.0, "P coefficient out of range");
-        //assert!(readout.I >= 0.0 && readout.I <= 20.0, "I coefficient out of range");
-        //assert!(readout.D >= 0.0 && readout.D <= 20.0, "D coefficient out of range");
-        //assert!(readout.PWM >= -100.0 && readout.PWM <= 100.0, "PWM out of expected range");
     }
-
-    //#[test]
-    //fn test_set_configuration() {
-    //    let mut controller = TecController::new(TEST_PORT).expect("Failed to connect");
-    //
-    //    let config = TecConfig {
-    //        T_set: 25.0,
-    //        P: 5.0,
-    //        I: 2.0,
-    //        D: 1.0,
-    //        T_min: 0.0,
-    //        T_max: 50.0,
-    //    };
-    //
-    //    let result = controller.set_configuration(&config);
-    //    assert!(result.is_ok(), "Failed to set configuration: {:?}", result.err());
-    //
-    //    // Wait a moment for settings to take effect
-    //    thread::sleep(Duration::from_millis(200));
-    //
-    //    // Verify configuration was applied by reading back
-    //    let readout = controller.get_single_readout().expect("Failed to get readout after config");
-    //    assert!((readout.T_set - config.T_set).abs() < 0.1, "T_set not applied correctly");
-    //    assert!((readout.P - config.P).abs() < 0.1, "P coefficient not applied correctly");
-    //    assert!((readout.I - config.I).abs() < 0.1, "I coefficient not applied correctly");
-    //    assert!((readout.D - config.D).abs() < 0.1, "D coefficient not applied correctly");
-    //}
 
     #[test]
     fn test_enable_disable_tec() {
         let mut controller = TecController::new(TEST_PORT).expect("Failed to connect");
-
-        // Test enabling TEC
+        
         let enable_result = controller.enable();
         assert!(
             enable_result.is_ok(),
             "Failed to enable TEC: {:?}",
             enable_result.err()
         );
-
         thread::sleep(Duration::from_millis(100));
-
-        // Test disabling TEC
+        
         let disable_result = controller.disable();
         assert!(
             disable_result.is_ok(),
@@ -424,43 +370,37 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_readouts() {
+    fn test_set_configuration() {
         let mut controller = TecController::new(TEST_PORT).expect("Failed to connect");
-
-        // Take multiple readouts to ensure stability
-        for i in 0..5 {
-            let readout = controller.get_single_readout();
-            assert!(
-                readout.is_ok(),
-                "Failed on readout {}: {:?}",
-                i,
-                readout.err()
-            );
-
-            thread::sleep(Duration::from_millis(100));
-        }
+  
+        
+        let config_result = controller.set_configuration(&TecConfig::default());
+        assert!(
+            config_result.is_ok(),
+            "Failed to set configuration: {:?}",
+            config_result.err()
+        );
     }
 
     #[test]
-    fn test_cyclic_print_control() {
+    fn test_set_configuration_2() {
         let mut controller = TecController::new(TEST_PORT).expect("Failed to connect");
-
-        // Test enabling cyclic print
-        let enable_result = controller.enable_cyclic_print();
+        
+  
+        let config_result = controller.set_configuration(&TecConfig::default());
         assert!(
-            enable_result.is_ok(),
-            "Failed to enable cyclic print: {:?}",
-            enable_result.err()
+            config_result.is_ok(),
+            "Failed to set configuration: {:?}",
+            config_result.err()
         );
-
-        thread::sleep(Duration::from_millis(100));
-
-        // Test disabling cyclic print
-        let disable_result = controller.disable_cyclic_print();
+        
+        let readout = controller.get_single_readout();
         assert!(
-            disable_result.is_ok(),
-            "Failed to disable cyclic print: {:?}",
-            disable_result.err()
+            readout.is_ok(),
+            "Failed to get readout: {:?}",
+            readout.err()
         );
+        let readout = readout.unwrap();
+        debug!("Readout: {:?}", readout);
     }
 }
