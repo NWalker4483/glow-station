@@ -1,4 +1,11 @@
 # Glow Station
+
+add fan speed control 
+add monitoring mode to tec struct 
+add indicators
+add button 
+
+20 pixels per mm 
 Disable Login over serial.
 Enable Hardware Serial
 sudo apt install libudev-dev

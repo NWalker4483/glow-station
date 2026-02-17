@@ -4,12 +4,9 @@ use crate::tec::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use nix::unistd::Pid;
-use nix::sys::signal::{self, Signal};
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Serialize, Deserialize)]
